@@ -1,3 +1,5 @@
+# coding: utf-8
+
 # May you do good and not evil
 # May you find forgiveness for yourself and forgive others
 # May you share freely, never taking more than you give.  -- SQLite source code
@@ -25,8 +27,6 @@ import re
 import sys
 import threading
 import uuid
-from bisect import bisect_left
-from bisect import bisect_right
 from collections import deque
 from collections import namedtuple
 try:
@@ -37,12 +37,11 @@ from copy import deepcopy
 from functools import wraps
 from inspect import isclass
 
-__version__ = '2.8.0'
+__version__ = '2.6.3'
 __all__ = [
     'BareField',
     'BigIntegerField',
     'BlobField',
-    'BinaryField',
     'BooleanField',
     'CharField',
     'Check',
@@ -53,7 +52,6 @@ __all__ = [
     'DateField',
     'DateTimeField',
     'DecimalField',
-    'DeferredRelation',
     'DoesNotExist',
     'DoubleField',
     'DQ',
@@ -139,17 +137,12 @@ else:
 
 # By default, peewee supports Sqlite, MySQL and Postgresql.
 try:
-    from pysqlite2 import dbapi2 as pysqlite
-except ImportError:
-    pysqlite = None
-try:
     import sqlite3
 except ImportError:
-    sqlite3 = pysqlite
-else:
-    if pysqlite and pysqlite.sqlite_version_info > sqlite3.sqlite_version_info:
-        sqlite3 = pysqlite
-
+    try:
+        from pysqlite2 import dbapi2 as sqlite3
+    except ImportError:
+        sqlite3 = None
 try:
     from psycopg2cffi import compat
     compat.register()
@@ -169,36 +162,8 @@ except ImportError:
         mysql = None
 
 try:
-    from playhouse._speedups import format_date_time
-    from playhouse._speedups import sort_models_topologically
-    from playhouse._speedups import strip_parens
+    from playhouse.speedups import strip_parens
 except ImportError:
-    def format_date_time(value, formats, post_process=None):
-        post_process = post_process or (lambda x: x)
-        for fmt in formats:
-            try:
-                return post_process(datetime.datetime.strptime(value, fmt))
-            except ValueError:
-                pass
-        return value
-
-    def sort_models_topologically(models):
-        """Sort models topologically so that parents will precede children."""
-        models = set(models)
-        seen = set()
-        ordering = []
-        def dfs(model):
-            if model in models and model not in seen:
-                seen.add(model)
-                for foreign_key in model._meta.reverse_rel.values():
-                    dfs(foreign_key.model_class)
-                ordering.append(model)  # parent will follow descendants
-        # Order models by name and table initially to guarantee total ordering.
-        names = lambda m: (m._meta.name, m._meta.db_table)
-        for m in sorted(models, key=names, reverse=True):
-            dfs(m)
-        return list(reversed(ordering))
-
     def strip_parens(s):
         # Quick sanity check.
         if not s or s[0] != '(':
@@ -232,15 +197,6 @@ except ImportError:
         if ct > 0:
             return s[ct:-ct]
         return s
-
-try:
-    from playhouse._speedups import _DictQueryResultWrapper
-    from playhouse._speedups import _ModelQueryResultWrapper
-    from playhouse._speedups import _SortedFieldList
-    from playhouse._speedups import _TuplesQueryResultWrapper
-except ImportError:
-    _DictQueryResultWrapper = _ModelQueryResultWrapper = _SortedFieldList =\
-            _TuplesQueryResultWrapper = None
 
 if sqlite3:
     sqlite3.register_adapter(decimal.Decimal, str)
@@ -331,12 +287,6 @@ JOIN_INNER = JOIN.INNER
 JOIN_LEFT_OUTER = JOIN.LEFT_OUTER
 JOIN_FULL = JOIN.FULL
 
-RESULTS_NAIVE = 1
-RESULTS_MODELS = 2
-RESULTS_TUPLES = 3
-RESULTS_DICTS = 4
-RESULTS_AGGREGATE_MODELS = 5
-
 # To support "django-style" double-underscore filters, create a mapping between
 # operation name and operation code, e.g. "__eq" == OP.EQ.
 DJANGO_MAP = {
@@ -411,16 +361,6 @@ class Proxy(object):
         if attr not in self.__slots__:
             raise AttributeError('Cannot set attribute on proxy.')
         return super(Proxy, self).__setattr__(attr, value)
-
-class DeferredRelation(object):
-    def set_field(self, model_class, field, name):
-        self.model_class = model_class
-        self.field = field
-        self.name = name
-
-    def set_model(self, rel_model):
-        self.field.rel_model = rel_model
-        self.field.add_to_class(self.model_class, self.name)
 
 class _CDescriptor(object):
     def __get__(self, instance, instance_type=None):
@@ -711,8 +651,10 @@ class Window(Node):
     def clone_base(self):
         return Window(self.partition_by, self.order_by)
 
-def Check(value):
-    return SQL('CHECK (%s)' % value)
+class Check(SQL):
+    """Check constraint, usage: `Check('price > 10')`."""
+    def __init__(self, value):
+        super(Check, self).__init__('CHECK (%s)' % value)
 
 class DQ(Node):
     """A "django-style" filter expression, e.g. {'foo__eq': 'x'}."""
@@ -903,7 +845,9 @@ class Field(Node):
         if not self.verbose_name:
             self.verbose_name = re.sub('_+', ' ', name).title()
 
-        model_class._meta.add_field(self)
+        model_class._meta.fields[self.name] = self
+        model_class._meta.columns[self.db_column] = self
+
         setattr(model_class, name, FieldDescriptor(self))
         self._is_bound = True
 
@@ -962,14 +906,6 @@ class Field(Node):
 
 class BareField(Field):
     db_field = 'bare'
-
-    def __init__(self, coerce=None, *args, **kwargs):
-        super(BareField, self).__init__(*args, **kwargs)
-        if coerce is not None:
-            self.coerce = coerce
-
-    def clone_base(self, **kwargs):
-        return super(BareField, self).clone_base(coerce=self.coerce, **kwargs)
 
 class IntegerField(Field):
     db_field = 'int'
@@ -1078,24 +1014,23 @@ class BlobField(Field):
             return binary_construct(value)
         return value
 
-class BinaryField(BlobField):
-    db_field = 'binary'
-
 class UUIDField(Field):
     db_field = 'uuid'
 
     def db_value(self, value):
-        if isinstance(value, uuid.UUID):
-            return value.hex
-        try:
-            return uuid.UUID(value).hex
-        except:
-            return value
+        return None if value is None else str(value)
 
     def python_value(self, value):
-        if isinstance(value, uuid.UUID):
-            return value
         return None if value is None else uuid.UUID(value)
+
+def format_date_time(value, formats, post_process=None):
+    post_process = post_process or (lambda x: x)
+    for fmt in formats:
+        try:
+            return post_process(datetime.datetime.strptime(value, fmt))
+        except ValueError:
+            pass
+    return value
 
 def _date_part(date_part):
     def dec(self):
@@ -1171,7 +1106,7 @@ class TimeField(_BaseFormattedField):
                 return format_date_time(value, self.formats, pp)
             elif isinstance(value, datetime.datetime):
                 return value.time()
-        if value is not None and isinstance(value, datetime.timedelta):
+        elif value is not None and isinstance(value, datetime.timedelta):
             return (datetime.datetime.min + value).time()
         return value
 
@@ -1241,14 +1176,13 @@ class ObjectIdDescriptor(object):
 class ForeignKeyField(IntegerField):
     def __init__(self, rel_model, related_name=None, on_delete=None,
                  on_update=None, extra=None, to_field=None, *args, **kwargs):
-        if rel_model != 'self' and not \
-                isinstance(rel_model, (Proxy, DeferredRelation)) and not \
+        if rel_model != 'self' and not isinstance(rel_model, Proxy) and not \
                 issubclass(rel_model, Model):
             raise TypeError('Unexpected value for `rel_model`.  Expected '
-                            '`Model`, `Proxy`, `DeferredRelation`, or "self"')
+                            '`Model`, `Proxy` or "self"')
         self.rel_model = rel_model
         self._related_name = related_name
-        self.deferred = isinstance(rel_model, (Proxy, DeferredRelation))
+        self.deferred = isinstance(rel_model, Proxy)
         self.on_delete = on_delete
         self.on_update = on_update
         self.extra = extra
@@ -1284,9 +1218,6 @@ class ForeignKeyField(IntegerField):
                 self.add_to_class(model_class, name)
             self.rel_model.attach_callback(callback)
             return
-        elif isinstance(self.rel_model, DeferredRelation):
-            self.rel_model.set_field(model_class, self, name)
-            return
 
         self.name = name
         self.model_class = model_class
@@ -1294,9 +1225,11 @@ class ForeignKeyField(IntegerField):
         if not self.verbose_name:
             self.verbose_name = re.sub('_+', ' ', name).title()
 
-        model_class._meta.add_field(self)
+        model_class._meta.fields[self.name] = self
+        model_class._meta.columns[self.db_column] = self
 
         self.related_name = self._get_related_name()
+
         if self.rel_model == 'self':
             self.rel_model = self.model_class
 
@@ -1349,11 +1282,6 @@ class ForeignKeyField(IntegerField):
         if isinstance(value, self.rel_model):
             value = value._get_pk_value()
         return self.to_field.db_value(value)
-
-    def python_value(self, value):
-        if isinstance(value, self.rel_model):
-            return value
-        return self.to_field.python_value(value)
 
 
 class CompositeKey(object):
@@ -1421,7 +1349,6 @@ class QueryCompiler(object):
     field_map = {
         'bare': '',
         'bigint': 'BIGINT',
-        'binary': 'BLOB',
         'blob': 'BLOB',
         'bool': 'SMALLINT',
         'date': 'DATE',
@@ -1836,7 +1763,7 @@ class QueryCompiler(object):
         alias_map = self.alias_map_class()
         alias_map.add(model, model._meta.db_table)
         if query._upsert:
-            statement = meta.database.upsert_sql
+            statement = 'INSERT OR REPLACE INTO'
         elif query._on_conflict:
             statement = 'INSERT OR %s INTO' % query._on_conflict
         else:
@@ -1953,16 +1880,10 @@ class QueryCompiler(object):
                        for f in meta.primary_key.field_names]
             constraints.append(Clause(
                 SQL('PRIMARY KEY'), EnclosedClause(*pk_cols)))
-        for field in meta.sorted_fields:
+        for field in meta.get_fields():
             columns.append(self.field_definition(field))
             if isinstance(field, ForeignKeyField) and not field.deferred:
                 constraints.append(self.foreign_key_constraint(field))
-
-        if model_class._meta.constraints:
-            for constraint in model_class._meta.constraints:
-                if not isinstance(constraint, Node):
-                    constraint = SQL(constraint)
-                constraints.append(constraint)
 
         return Clause(
             SQL(statement),
@@ -2060,9 +1981,6 @@ class QueryResultWrapper(object):
         self.fill_cache()
         return self._ct
 
-    def __len__(self):
-        return self.count
-
     def process_row(self, row):
         return row
 
@@ -2104,7 +2022,7 @@ class QueryResultWrapper(object):
         self._idx = self._ct
         while not self._populated and (n > self._ct):
             try:
-                next(self)
+                self.next()
             except StopIteration:
                 break
 
@@ -2147,9 +2065,6 @@ class TuplesQueryResultWrapper(ExtQueryResultWrapper):
     def process_row(self, row):
         return tuple([self.conv[i][2](col) for i, col in enumerate(row)])
 
-if _TuplesQueryResultWrapper is None:
-    _TuplesQueryResultWrapper = TuplesQueryResultWrapper
-
 class NaiveQueryResultWrapper(ExtQueryResultWrapper):
     def process_row(self, row):
         instance = self.model()
@@ -2158,18 +2073,12 @@ class NaiveQueryResultWrapper(ExtQueryResultWrapper):
         instance._prepare_instance()
         return instance
 
-if _ModelQueryResultWrapper is None:
-    _ModelQueryResultWrapper = NaiveQueryResultWrapper
-
 class DictQueryResultWrapper(ExtQueryResultWrapper):
     def process_row(self, row):
         res = {}
         for i, column, func in self.conv:
             res[column] = func(row[i])
         return res
-
-if _DictQueryResultWrapper is None:
-    _DictQueryResultWrapper = DictQueryResultWrapper
 
 class ModelQueryResultWrapper(QueryResultWrapper):
     def initialize(self, description):
@@ -2518,7 +2427,7 @@ class Query(Node):
             elif isinstance(arg, ModelAlias):
                 accum.extend(arg.get_proxy_fields())
             elif isclass(arg) and issubclass(arg, Model):
-                accum.extend(arg._meta.sorted_fields)
+                accum.extend(arg._meta.get_fields())
         return accum
 
     @returns_clone
@@ -2677,12 +2586,12 @@ class RawQuery(Query):
     def execute(self):
         if self._qr is None:
             if self._tuples:
-                QRW = self.database.get_result_wrapper(RESULTS_TUPLES)
+                ResultWrapper = TuplesQueryResultWrapper
             elif self._dicts:
-                QRW = self.database.get_result_wrapper(RESULTS_DICTS)
+                ResultWrapper = DictQueryResultWrapper
             else:
-                QRW = self.database.get_result_wrapper(RESULTS_NAIVE)
-            self._qr = QRW(self.model_class, self._execute(), None)
+                ResultWrapper = NaiveQueryResultWrapper
+            self._qr = ResultWrapper(self.model_class, self._execute(), None)
         return self._qr
 
     def __iter__(self):
@@ -2765,7 +2674,7 @@ class SelectQuery(Query):
 
     def __select(self, *selection):
         self._explicit_selection = len(selection) > 0
-        selection = selection or self.model_class._meta.sorted_fields
+        selection = selection or self.model_class._meta.get_fields()
         self._select = self._model_shorthand(selection)
     select = returns_clone(__select)
 
@@ -2882,7 +2791,7 @@ class SelectQuery(Query):
     def get(self):
         clone = self.paginate(1, 1)
         try:
-            return next(clone.execute())
+            return clone.execute().next()
         except StopIteration:
             raise self.model_class.DoesNotExist(
                 'Instance matching query does not exist:\nSQL: %s\nPARAMS: %s'
@@ -2914,15 +2823,15 @@ class SelectQuery(Query):
 
     def _get_result_wrapper(self):
         if self._tuples:
-            return self.database.get_result_wrapper(RESULTS_TUPLES)
+            return TuplesQueryResultWrapper
         elif self._dicts:
-            return self.database.get_result_wrapper(RESULTS_DICTS)
+            return DictQueryResultWrapper
         elif self._naive or not self._joins or self.verify_naive():
-            return self.database.get_result_wrapper(RESULTS_NAIVE)
+            return NaiveQueryResultWrapper
         elif self._aggregate_rows:
-            return self.database.get_result_wrapper(RESULTS_AGGREGATE_MODELS)
+            return AggregateQueryResultWrapper
         else:
-            return self.database.get_result_wrapper(RESULTS_MODELS)
+            return ModelQueryResultWrapper
 
     def execute(self):
         if self._dirty or self._qr is None:
@@ -2952,9 +2861,6 @@ class SelectQuery(Query):
         res.fill_cache(index)
         return res._result_cache[value]
 
-    def __len__(self):
-        return len(self.execute())
-
     if PY3:
         def __hash__(self):
             return id(self)
@@ -2983,18 +2889,18 @@ class CompoundSelect(SelectQuery):
 
     def _get_result_wrapper(self):
         if self._tuples:
-            return self.database.get_result_wrapper(RESULTS_TUPLES)
+            return TuplesQueryResultWrapper
         elif self._dicts:
-            return self.database.get_result_wrapper(RESULTS_DICTS)
+            return DictQueryResultWrapper
         elif self._aggregate_rows:
-            return self.database.get_result_wrapper(RESULTS_AGGREGATE_MODELS)
+            return AggregateQueryResultWrapper
 
         has_joins = self.lhs._joins or self.rhs._joins
         is_naive = self.lhs._naive or self.rhs._naive or self._naive
         if is_naive or not has_joins or self.verify_naive():
-            return self.database.get_result_wrapper(RESULTS_NAIVE)
+            return NaiveQueryResultWrapper
         else:
-            return self.database.get_result_wrapper(RESULTS_MODELS)
+            return ModelQueryResultWrapper
 
 class _WriteQuery(Query):
     def __init__(self, model_class):
@@ -3028,7 +2934,7 @@ class _WriteQuery(Query):
             self._returning = None
         else:
             if not selection:
-                selection = self.model_class._meta.sorted_fields
+                selection = self.model_class._meta.get_fields()
             self._returning = self._model_shorthand(selection)
 
     @requires_returning
@@ -3044,10 +2950,10 @@ class _WriteQuery(Query):
     def get_result_wrapper(self):
         if self._returning is not None:
             if self._tuples:
-                return self.database.get_result_wrapper(RESULTS_TUPLES)
+                return TuplesQueryResultWrapper
             elif self._dicts:
-                return self.database.get_result_wrapper(RESULTS_DICTS)
-        return self.database.get_result_wrapper(RESULTS_NAIVE)
+                return DictQueryResultWrapper
+        return NaiveQueryResultWrapper
 
     def _execute_with_result_wrapper(self):
         ResultWrapper = self.get_result_wrapper()
@@ -3097,7 +3003,7 @@ class UpdateQuery(_WriteQuery):
 
 class InsertQuery(_WriteQuery):
     def __init__(self, model_class, field_dict=None, rows=None,
-                 fields=None, query=None, validate_fields=False):
+                 fields=None, query=None):
         super(InsertQuery, self).__init__(model_class)
 
         self._upsert = False
@@ -3110,17 +3016,15 @@ class InsertQuery(_WriteQuery):
 
         self._fields = fields
         self._query = query
-        self._validate_fields = validate_fields
         self._on_conflict = None
 
     def _iter_rows(self):
         model_meta = self.model_class._meta
-        if self._validate_fields:
-            valid_fields = (set(model_meta.fields.keys()) |
-                            set(model_meta.fields.values()))
-            def validate_field(field):
-                if field not in valid_fields:
-                    raise KeyError('"%s" is not a recognized field.' % field)
+        valid_fields = (set(model_meta.fields.keys()) |
+                        set(model_meta.fields.values()))
+        def validate_field(field):
+            if field not in valid_fields:
+                raise KeyError('"%s" is not a recognized field.' % field)
 
         defaults = model_meta._default_dict
         callables = model_meta._default_callables
@@ -3129,8 +3033,7 @@ class InsertQuery(_WriteQuery):
             field_row = defaults.copy()
             seen = set()
             for key in row_dict:
-                if self._validate_fields:
-                    validate_field(key)
+                validate_field(key)
                 if key in model_meta.fields:
                     field = model_meta.fields[key]
                 else:
@@ -3151,7 +3054,6 @@ class InsertQuery(_WriteQuery):
         query._fields = self._fields
         query._query = self._query
         query._return_id_list = self._return_id_list
-        query._validate_fields = self._validate_fields
         query._on_conflict = self._on_conflict
         return query
 
@@ -3318,7 +3220,6 @@ class Database(object):
     savepoints = True
     sequences = False
     subquery_delete_same_table = True
-    upsert_sql = None
     window_functions = False
 
     exceptions = {
@@ -3333,29 +3234,25 @@ class Database(object):
         'ProgrammingError': ProgrammingError}
 
     def __init__(self, database, threadlocals=True, autocommit=True,
-                 fields=None, ops=None, autorollback=False, use_speedups=True,
-                 **connect_kwargs):
-        self.connect_kwargs = {}
+                 fields=None, ops=None, autorollback=False, **connect_kwargs):
+        self.init(database, **connect_kwargs)
+
         if threadlocals:
             self.__local = _ConnectionLocal()
         else:
             self.__local = _BaseConnectionLocal()
-        self.init(database, **connect_kwargs)
 
         self._conn_lock = threading.Lock()
         self.autocommit = autocommit
         self.autorollback = autorollback
-        self.use_speedups = use_speedups
 
         self.field_overrides = merge_dict(self.field_overrides, fields or {})
         self.op_overrides = merge_dict(self.op_overrides, ops or {})
 
     def init(self, database, **connect_kwargs):
-        if not self.is_closed():
-            self.close()
         self.deferred = database is None
         self.database = database
-        self.connect_kwargs.update(connect_kwargs)
+        self.connect_kwargs = connect_kwargs
 
     def exception_wrapper(self):
         return ExceptionWrapper(self.exceptions)
@@ -3413,24 +3310,6 @@ class Database(object):
     def register_ops(cls, ops):
         cls.op_overrides = merge_dict(cls.op_overrides, ops)
 
-    def get_result_wrapper(self, wrapper_type):
-        if wrapper_type == RESULTS_NAIVE:
-            return (_ModelQueryResultWrapper if self.use_speedups
-                    else NaiveQueryResultWrapper)
-        elif wrapper_type == RESULTS_MODELS:
-            return ModelQueryResultWrapper
-        elif wrapper_type == RESULTS_TUPLES:
-            return (_TuplesQueryResultWrapper if self.use_speedups
-                    else TuplesQueryResultWrapper)
-        elif wrapper_type == RESULTS_DICTS:
-            return (_DictQueryResultWrapper if self.use_speedups
-                    else DictQueryResultWrapper)
-        elif wrapper_type == RESULTS_AGGREGATE_MODELS:
-            return AggregateQueryResultWrapper
-        else:
-            return (_ModelQueryResultWrapper if self.use_speedups
-                    else NaiveQueryResultWrapper)
-
     def last_insert_id(self, cursor, model):
         if model._meta.auto_increment:
             return cursor.lastrowid
@@ -3438,13 +3317,13 @@ class Database(object):
     def rows_affected(self, cursor):
         return cursor.rowcount
 
+    def sql_error_handler(self, exception, sql, params, require_commit):
+        return True
+
     def compiler(self):
         return self.compiler_class(
             self.quote_char, self.interpolation, self.field_overrides,
             self.op_overrides)
-
-    def execute(self, clause):
-        return self.execute_sql(*self.compiler().parse_node(clause))
 
     def execute_sql(self, sql, params=None, require_commit=True):
         logger.debug((sql, params))
@@ -3452,10 +3331,11 @@ class Database(object):
             cursor = self.get_cursor()
             try:
                 cursor.execute(sql, params or ())
-            except Exception:
+            except Exception as exc:
                 if self.get_autocommit() and self.autorollback:
                     self.rollback()
-                raise
+                if self.sql_error_handler(exc, sql, params, require_commit):
+                    raise
             else:
                 if require_commit and self.get_autocommit():
                     self.commit()
@@ -3585,9 +3465,6 @@ class Database(object):
         return SQL('DEFAULT VALUES')
 
 class SqliteDatabase(Database):
-    field_overrides = {
-        'uuid': 'TEXT',
-    }
     foreign_keys = False
     insert_many = sqlite3 and sqlite3.sqlite_version_info >= (3, 7, 11, 0)
     limit_max = -1
@@ -3595,7 +3472,6 @@ class SqliteDatabase(Database):
         OP.LIKE: 'GLOB',
         OP.ILIKE: 'LIKE',
     }
-    upsert_sql = 'INSERT OR REPLACE INTO'
 
     def __init__(self, database, pragmas=None, *args, **kwargs):
         self._pragmas = pragmas or []
@@ -3604,15 +3480,13 @@ class SqliteDatabase(Database):
             self._pragmas.append(('journal_mode', journal_mode))
 
         super(SqliteDatabase, self).__init__(database, *args, **kwargs)
+        if not self.database:
+            self.database = ':memory:'
 
     def _connect(self, database, **kwargs):
         conn = sqlite3.connect(database, **kwargs)
         conn.isolation_level = None
-        try:
-            self._add_conn_hooks(conn)
-        except:
-            conn.close()
-            raise
+        self._add_conn_hooks(conn)
         return conn
 
     def _add_conn_hooks(self, conn):
@@ -3630,10 +3504,6 @@ class SqliteDatabase(Database):
 
     def begin(self, lock_type='DEFERRED'):
         self.execute_sql('BEGIN %s' % lock_type, require_commit=False)
-
-    def create_foreign_key(self, model_class, field, constraint=None):
-        raise OperationalError('SQLite does not support ALTER TABLE '
-                               'statements to add constraints.')
 
     def get_tables(self, schema=None):
         cursor = self.execute_sql('SELECT name FROM sqlite_master WHERE '
@@ -3706,7 +3576,6 @@ class PostgresqlDatabase(Database):
         'double': 'DOUBLE PRECISION',
         'primary_key': 'SERIAL',
         'uuid': 'UUID',
-        'binary': 'BYTEA'
     }
     for_update = True
     for_update_nowait = True
@@ -3735,7 +3604,7 @@ class PostgresqlDatabase(Database):
 
     def _get_pk_sequence(self, model):
         meta = model._meta
-        if meta.primary_key is not False and meta.primary_key.sequence:
+        if meta.primary_key.sequence:
             return meta.primary_key.sequence
         elif meta.auto_increment:
             return '%s_%s_seq' % (meta.db_table, meta.primary_key.db_column)
@@ -3843,13 +3712,11 @@ class MySQLDatabase(Database):
     compound_operations = ['UNION', 'UNION ALL']
     field_overrides = {
         'bool': 'BOOL',
-        'binary': 'BINARY',
         'decimal': 'NUMERIC',
         'double': 'DOUBLE PRECISION',
         'float': 'FLOAT',
         'primary_key': 'INTEGER AUTO_INCREMENT',
         'text': 'LONGTEXT',
-        'uuid': 'VARCHAR(255)',
     }
     for_update = True
     interpolation = '%s'
@@ -3861,7 +3728,6 @@ class MySQLDatabase(Database):
     }
     quote_char = '`'
     subquery_delete_same_table = False
-    upsert_sql = 'REPLACE INTO'
 
     def _connect(self, database, **kwargs):
         if not mysql:
@@ -4132,7 +3998,7 @@ class ModelAlias(object):
 
     def get_proxy_fields(self):
         return [
-            FieldProxy(self, f) for f in self.model_class._meta.sorted_fields]
+            FieldProxy(self, f) for f in self.model_class._meta.get_fields()]
 
     def select(self, *selection):
         if not selection:
@@ -4145,39 +4011,6 @@ class ModelAlias(object):
     def __call__(self, **kwargs):
         return self.model_class(**kwargs)
 
-if _SortedFieldList is None:
-    class _SortedFieldList(object):
-        __slots__ = ('_keys', '_items')
-
-        def __init__(self):
-            self._keys = []
-            self._items = []
-
-        def __getitem__(self, i):
-            return self._items[i]
-
-        def __iter__(self):
-            return iter(self._items)
-
-        def __contains__(self, item):
-            k = item._sort_key
-            i = bisect_left(self._keys, k)
-            j = bisect_right(self._keys, k)
-            return item in self._items[i:j]
-
-        def index(self, field):
-            return self._keys.index(field._sort_key)
-
-        def insert(self, item):
-            k = item._sort_key
-            i = bisect_left(self._keys, k)
-            self._keys.insert(i, k)
-            self._items.insert(i, item)
-
-        def remove(self, item):
-            idx = self.index(item)
-            del self._items[idx]
-            del self._keys[idx]
 
 class DoesNotExist(Exception): pass
 
@@ -4190,7 +4023,7 @@ class ModelOptions(object):
     def __init__(self, cls, database=None, db_table=None, db_table_func=None,
                  indexes=None, order_by=None, primary_key=None,
                  table_alias=None, constraints=None, schema=None,
-                 validate_backrefs=True, only_save_dirty=False, **kwargs):
+                 validate_backrefs=True, **kwargs):
         self.model_class = cls
         self.name = cls.__name__.lower()
         self.fields = {}
@@ -4199,10 +4032,6 @@ class ModelOptions(object):
         self._default_by_name = {}
         self._default_dict = {}
         self._default_callables = {}
-        self._default_callable_list = []
-        self._sorted_field_list = _SortedFieldList()
-        self.sorted_fields = []
-        self.sorted_field_names = []
 
         self.database = database or default_database
         self.db_table = db_table
@@ -4214,7 +4043,6 @@ class ModelOptions(object):
         self.constraints = constraints
         self.schema = schema
         self.validate_backrefs = validate_backrefs
-        self.only_save_dirty = only_save_dirty
 
         self.auto_increment = None
         self.composite_key = False
@@ -4229,68 +4057,50 @@ class ModelOptions(object):
             self.db_table = self.db_table_func(cls)
 
     def prepared(self):
+        for field in self.fields.values():
+            if field.default is not None:
+                self.defaults[field] = field.default
+                if callable(field.default):
+                    self._default_callables[field] = field.default
+                else:
+                    self._default_dict[field] = field.default
+                    self._default_by_name[field.name] = field.default
+
         if self.order_by:
             norm_order_by = []
             for item in self.order_by:
                 if isinstance(item, Field):
                     prefix = '-' if item._ordering == 'DESC' else ''
                     item = prefix + item.name
-                field = self.fields[item.lstrip('-')]
+                field = self.fields[item.lstrip('-')]#看！这是‘-’实现倒排的地方
                 if item.startswith('-'):
                     norm_order_by.append(field.desc())
                 else:
                     norm_order_by.append(field.asc())
             self.order_by = norm_order_by
 
-    def add_field(self, field):
-        self.remove_field(field.name)
-        self.fields[field.name] = field
-        self.columns[field.db_column] = field
-
-        self._sorted_field_list.insert(field)
-        self.sorted_fields = list(self._sorted_field_list)
-        self.sorted_field_names = [f.name for f in self.sorted_fields]
-
-        if field.default is not None:
-            self.defaults[field] = field.default
-            if callable(field.default):
-                self._default_callables[field] = field.default
-                self._default_callable_list.append((field.name, field.default))
-            else:
-                self._default_dict[field] = field.default
-                self._default_by_name[field.name] = field.default
-
-    def remove_field(self, field_name):
-        if field_name not in self.fields:
-            return
-        original = self.fields.pop(field_name)
-        del self.columns[original.db_column]
-        self._sorted_field_list.remove(original)
-        self.sorted_fields = list(self._sorted_field_list)
-        self.sorted_field_names = [f.name for f in self.sorted_fields]
-
-        if original.default is not None:
-            del self.defaults[original]
-            if self._default_callables.pop(original, None):
-                for i, (name, _) in enumerate(self._default_callable_list):
-                    if name == field_name:
-                        self._default_callable_list.pop(i)
-                        break
-            else:
-                self._default_dict.pop(original, None)
-                self._default_by_name.pop(original.name, None)
-
     def get_default_dict(self):
         dd = self._default_by_name.copy()
-        for field_name, default in self._default_callable_list:
-            dd[field_name] = default()
+        if self._default_callables:
+            for field, default in self._default_callables.items():
+                dd[field.name] = default()
         return dd
 
+    def get_sorted_fields(self):
+        key = lambda i: i[1]._sort_key
+        return sorted(self.fields.items(), key=key)
+
+    def get_field_names(self):
+        return [f[0] for f in self.get_sorted_fields()]
+
+    def get_fields(self):
+        return [f[1] for f in self.get_sorted_fields()]
+
     def get_field_index(self, field):
-        try:
-            return self._sorted_field_list.index(field)
-        except ValueError:
-            return -1
+        for i, (field_name, field_obj) in enumerate(self.get_sorted_fields()):
+            if field_name == field.name:
+                return i
+        return -1
 
     def get_primary_key_fields(self):
         if self.composite_key:
@@ -4299,26 +4109,20 @@ class ModelOptions(object):
                 for field_name in self.primary_key.field_names]
         return [self.primary_key]
 
-    def rel_for_model(self, model, field_obj=None, multi=False):
+    def rel_for_model(self, model, field_obj=None):
         is_field = isinstance(field_obj, Field)
         is_node = not is_field and isinstance(field_obj, Node)
-        if multi:
-            accum = []
-        for field in self.sorted_fields:
+        for field in self.get_fields():
             if isinstance(field, ForeignKeyField) and field.rel_model == model:
                 is_match = (
                     (field_obj is None) or
                     (is_field and field_obj.name == field.name) or
                     (is_node and field_obj._alias == field.name))
                 if is_match:
-                    if not multi:
-                        return field
-                    accum.append(field)
-        if multi:
-            return accum
+                    return field
 
-    def reverse_rel_for_model(self, model, field_obj=None, multi=False):
-        return model._meta.rel_for_model(self.model_class, field_obj, multi)
+    def reverse_rel_for_model(self, model, field_obj=None):
+        return model._meta.rel_for_model(self.model_class, field_obj)
 
     def rel_exists(self, model):
         return self.rel_for_model(model) or self.reverse_rel_for_model(model)
@@ -4342,20 +4146,20 @@ class ModelOptions(object):
 class BaseModel(type):
     inheritable = set([
         'constraints', 'database', 'db_table_func', 'indexes', 'order_by',
-        'primary_key', 'schema', 'validate_backrefs', 'only_save_dirty'])
+        'primary_key', 'schema', 'validate_backrefs'])
 
     def __new__(cls, name, bases, attrs):
         if not bases:
+            #骗人的吧，不是有个object吗
             return super(BaseModel, cls).__new__(cls, name, bases, attrs)
-
         meta_options = {}
-        meta = attrs.pop('Meta', None)
+        meta = attrs.pop('Meta', None)#这就是我们定义model的时候的那个叫Meta的class
         if meta:
             for k, v in meta.__dict__.items():
                 if not k.startswith('_'):
                     meta_options[k] = v
 
-        model_pk = getattr(meta, 'primary_key', None)
+        model_pk = getattr(meta, 'primary_key', None)#从meta里取pk
         parent_pk = None
 
         # inherit any field descriptors by deep copying the underlying field
@@ -4382,30 +4186,30 @@ class BaseModel(type):
 
         # initialize the new class and set the magic attributes
         cls = super(BaseModel, cls).__new__(cls, name, bases, attrs)
-        cls._meta = ModelOptions(cls, **meta_options)
+        cls._meta = ModelOptions(cls, **meta_options)#看！前面去的meta的东西放到这里了
         cls._data = None
-        cls._meta.indexes = list(cls._meta.indexes)
+        cls._meta.indexes = list(cls._meta.indexes)#这是做数据库索引的那个
 
         if not cls._meta.db_table:
-            cls._meta.db_table = re.sub('[^\w]+', '_', cls.__name__.lower())
+            cls._meta.db_table = re.sub('[^\w]+', '_', cls.__name__.lower())#看！这是定义数据库的表名的，有兴趣的可以看django定义的app_table形式的
 
         # replace fields with field descriptors, calling the add_to_class hook
         fields = []
         for name, attr in cls.__dict__.items():
             if isinstance(attr, Field):
                 if attr.primary_key and model_pk:
-                    raise ValueError('primary key is overdetermined.')
+                    raise ValueError('primary key is overdetermined.')#防止重复定义pk
                 elif attr.primary_key:
                     model_pk, pk_name = attr, name
                 else:
                     fields.append((attr, name))
 
-        composite_key = False
+        composite_key = False#这个是联合主键
         if model_pk is None:
             if parent_pk:
                 model_pk, pk_name = parent_pk, parent_pk.name
             else:
-                model_pk, pk_name = PrimaryKeyField(primary_key=True), 'id'
+                model_pk, pk_name = PrimaryKeyField(primary_key=True), 'id'#如果没有定义，送你一个，不要钱哦
         elif isinstance(model_pk, CompositeKey):
             pk_name = '_composite_key'
             composite_key = True
@@ -4427,13 +4231,9 @@ class BaseModel(type):
                 cls.__name__, self.__unicode__()))
 
         exc_name = '%sDoesNotExist' % cls.__name__
-        exc_attrs = {'__module__': cls.__module__}
-        exception_class = type(exc_name, (DoesNotExist,), exc_attrs)
+        exception_class = type(exc_name, (DoesNotExist,), {})
         cls.DoesNotExist = exception_class
         cls._meta.prepared()
-
-        if hasattr(cls, 'validate_model'):
-            cls.validate_model()
 
         return cls
 
@@ -4455,26 +4255,23 @@ class Model(with_metaclass(BaseModel)):
 
     @classmethod
     def select(cls, *selection):
-        query = SelectQuery(cls, *selection)
+        query = SelectQuery(cls, *selection)#从这里我们就可以去看SelectQuery是搞啥的了
         if cls._meta.order_by:
             query = query.order_by(*cls._meta.order_by)
         return query
 
     @classmethod
-    def update(cls, __data=None, **update):
-        fdict = __data or {}
-        fdict.update([(cls._meta.fields[f], update[f]) for f in update])
+    def update(cls, **update):
+        fdict = dict((cls._meta.fields[f], v) for f, v in update.items())
         return UpdateQuery(cls, fdict)
 
     @classmethod
-    def insert(cls, __data=None, **insert):
-        fdict = __data or {}
-        fdict.update([(cls._meta.fields[f], insert[f]) for f in insert])
-        return InsertQuery(cls, fdict)
+    def insert(cls, **insert):
+        return InsertQuery(cls, insert)
 
     @classmethod
-    def insert_many(cls, rows, validate_fields=True):
-        return InsertQuery(cls, rows=rows, validate_fields=True)
+    def insert_many(cls, rows):
+        return InsertQuery(cls, rows=rows)
 
     @classmethod
     def insert_from(cls, fields, query):
@@ -4554,7 +4351,7 @@ class Model(with_metaclass(BaseModel)):
 
         db = cls._meta.database
         pk = cls._meta.primary_key
-        if db.sequences and pk is not False and pk.sequence:
+        if db.sequences and pk.sequence:
             if not db.sequence_exists(pk.sequence):
                 db.create_sequence(pk.sequence)
 
@@ -4650,21 +4447,10 @@ class Model(with_metaclass(BaseModel)):
 
     def save(self, force_insert=False, only=None):
         field_dict = dict(self._data)
-        if self._meta.primary_key is not False:
-            pk_field = self._meta.primary_key
-            pk_value = self._get_pk_value()
-        else:
-            pk_field = pk_value = None
+        pk_field = self._meta.primary_key
+        pk_value = self._get_pk_value()
         if only:
             field_dict = self._prune_fields(field_dict, only)
-        elif self._meta.only_save_dirty and not force_insert:
-            field_dict = self._prune_fields(
-                field_dict,
-                self.dirty_fields)
-            if not field_dict:
-                self._dirty.clear()
-                return False
-
         self._populate_unsaved_relations(field_dict)
         if pk_value is not None and not force_insert:
             if self._meta.composite_key:
@@ -4673,9 +4459,6 @@ class Model(with_metaclass(BaseModel)):
             else:
                 field_dict.pop(pk_field.name, None)
             rows = self.update(**field_dict).where(self._pk_expr()).execute()
-        elif pk_field is None:
-            self.insert(**field_dict).execute()
-            rows = 1
         else:
             pk_from_cursor = self.insert(**field_dict).execute()
             if pk_from_cursor is not None:
@@ -4690,7 +4473,7 @@ class Model(with_metaclass(BaseModel)):
 
     @property
     def dirty_fields(self):
-        return [f for f in self._meta.sorted_fields if f.name in self._dirty]
+        return [f for f in self._meta.get_fields() if f.name in self._dirty]
 
     def dependencies(self, search_nullable=False):
         model_class = type(self)
@@ -4735,104 +4518,80 @@ class Model(with_metaclass(BaseModel)):
     def __ne__(self, other):
         return not self == other
 
-def clean_prefetch_subquery(query):
-    query._group_by = query._having = None
-    return query
 
 def prefetch_add_subquery(sq, subqueries):
     fixed_queries = [PrefetchResult(sq)]
     for i, subquery in enumerate(subqueries):
-        if isinstance(subquery, tuple):
-            subquery, target_model = subquery
-        else:
-            target_model = None
         if not isinstance(subquery, Query) and issubclass(subquery, Model):
             subquery = subquery.select()
         subquery_model = subquery.model_class
-        fks = backrefs = None
+        fkf = backref = None
         for j in reversed(range(i + 1)):
-            prefetch_result = fixed_queries[j]
-            last_query = prefetch_result.query
-            last_model = prefetch_result.model
-            rels = subquery_model._meta.rel_for_model(last_model, multi=True)
-            if rels:
-                fks = [getattr(subquery_model, fk.name) for fk in rels]
-                pks = [getattr(last_model, fk.to_field.name) for fk in rels]
+            last_query = fixed_queries[j][0]
+            last_model = last_query.model_class
+            foreign_key = subquery_model._meta.rel_for_model(last_model)
+            if foreign_key:
+                fkf = getattr(subquery_model, foreign_key.name)
+                to_field = getattr(last_model, foreign_key.to_field.name)
             else:
-                backrefs = last_model._meta.rel_for_model(
-                    subquery_model,
-                    multi=True)
+                backref = last_model._meta.rel_for_model(subquery_model)
 
-            if (fks or backrefs) and ((target_model is last_model) or
-                                      (target_model is None)):
+            if fkf or backref:
                 break
 
-        if not (fks or backrefs):
-            tgt_err = ' using %s' % target_model if target_model else ''
+        if not (fkf or backref):
             raise AttributeError('Error: unable to find foreign key for '
-                                 'query: %s%s' % (subquery, tgt_err))
+                                 'query: %s' % subquery)
 
-        if fks:
-            cleaned = clean_prefetch_subquery(last_query)
-            expr = reduce(operator.or_, [
-                (fk << cleaned.select(pk))
-                for (fk, pk) in zip(fks, pks)])
-            subquery = subquery.where(expr)
-            fixed_queries.append(PrefetchResult(subquery, fks, False))
-        elif backrefs:
-            cleaned = clean_prefetch_subquery(last_query)
-            expr = reduce(operator.or_, [
-                (backref.to_field << cleaned.select(backref))
-                for backref in backrefs])
-            subquery = subquery.where(expr)
-            fixed_queries.append(PrefetchResult(subquery, backrefs, True))
+        if fkf:
+            inner_query = last_query.select(to_field)
+            fixed_queries.append(
+                PrefetchResult(subquery.where(fkf << inner_query), fkf, False))
+        elif backref:
+            q = subquery.where(backref.to_field << last_query.select(backref))
+            fixed_queries.append(PrefetchResult(q, backref, True))
 
     return fixed_queries
 
 __prefetched = namedtuple('__prefetched', (
-    'query', 'fields', 'backref', 'rel_models', 'field_to_name', 'model'))
+    'query', 'field', 'backref', 'rel_model', 'foreign_key_attr', 'model'))
 
 class PrefetchResult(__prefetched):
-    def __new__(cls, query, fields=None, backref=None, rel_models=None,
-                field_to_name=None, model=None):
-        if fields:
+    def __new__(cls, query, field=None, backref=None, rel_model=None,
+                foreign_key_attr=None, model=None):
+        if field:
             if backref:
-                rel_models = [field.model_class for field in fields]
-                foreign_key_attrs = [field.to_field.name for field in fields]
+                rel_model = field.model_class
+                foreign_key_attr = field.to_field.name
             else:
-                rel_models = [field.rel_model for field in fields]
-                foreign_key_attrs = [field.name for field in fields]
-            field_to_name = list(zip(fields, foreign_key_attrs))
+                rel_model = field.rel_model
+                foreign_key_attr = field.name
         model = query.model_class
         return super(PrefetchResult, cls).__new__(
-            cls, query, fields, backref, rel_models, field_to_name, model)
+            cls, query, field, backref, rel_model, foreign_key_attr, model)
 
     def populate_instance(self, instance, id_map):
         if self.backref:
-            for field in self.fields:
-                identifier = instance._data[field.name]
-                key = (field, identifier)
-                if key in id_map:
-                    setattr(instance, field.name, id_map[key])
+            identifier = instance._data[self.field.name]
+            if identifier in id_map:
+                setattr(instance, self.field.name, id_map[identifier])
         else:
-            for field, attname in self.field_to_name:
-                identifier = instance._data[field.to_field.name]
-                key = (field, identifier)
-                rel_instances = id_map.get(key, [])
-                dest = '%s_prefetch' % field.related_name
-                for inst in rel_instances:
-                    setattr(inst, attname, instance)
-                setattr(instance, dest, rel_instances)
+            identifier = instance._data[self.field.to_field.name]
+            rel_instances = id_map.get(identifier, [])
+            attname = self.foreign_key_attr
+            dest = '%s_prefetch' % self.field.related_name
+            for inst in rel_instances:
+                setattr(inst, attname, instance)
+            setattr(instance, dest, rel_instances)
 
     def store_instance(self, instance, id_map):
-        for field, attname in self.field_to_name:
-            identity = field.to_field.python_value(instance._data[attname])
-            key = (field, identity)
-            if self.backref:
-                id_map[key] = instance
-            else:
-                id_map.setdefault(key, [])
-                id_map[key].append(instance)
+        identity = self.field.to_field.python_value(
+            instance._data[self.foreign_key_attr])
+        if self.backref:
+            id_map[identity] = instance
+        else:
+            id_map.setdefault(identity, [])
+            id_map[identity].append(instance)
 
 
 def prefetch(sq, *subqueries):
@@ -4844,17 +4603,16 @@ def prefetch(sq, *subqueries):
     rel_map = {}
     for prefetch_result in reversed(fixed_queries):
         query_model = prefetch_result.model
-        if prefetch_result.fields:
-            for rel_model in prefetch_result.rel_models:
-                rel_map.setdefault(rel_model, [])
-                rel_map[rel_model].append(prefetch_result)
+        if prefetch_result.field:
+            rel_map.setdefault(prefetch_result.rel_model, [])
+            rel_map[prefetch_result.rel_model].append(prefetch_result)
 
         deps[query_model] = {}
         id_map = deps[query_model]
         has_relations = bool(rel_map.get(query_model))
 
         for instance in prefetch_result.query:
-            if prefetch_result.fields:
+            if prefetch_result.field:
                 prefetch_result.store_instance(instance, id_map)
 
             if has_relations:
@@ -4872,3 +4630,20 @@ def drop_model_tables(models, **drop_table_kwargs):
     """Drop tables for all given models (in the right order)."""
     for m in reversed(sort_models_topologically(models)):
         m.drop_table(**drop_table_kwargs)
+
+def sort_models_topologically(models):
+    """Sort models topologically so that parents will precede children."""
+    models = set(models)
+    seen = set()
+    ordering = []
+    def dfs(model):
+        if model in models and model not in seen:
+            seen.add(model)
+            for foreign_key in model._meta.reverse_rel.values():
+                dfs(foreign_key.model_class)
+            ordering.append(model)  # parent will follow descendants
+    # order models by name and table initially to guarantee a total ordering
+    names = lambda m: (m._meta.name, m._meta.db_table)
+    for m in sorted(models, key=names, reverse=True):
+        dfs(m)
+    return list(reversed(ordering))  # want parents first in output ordering
