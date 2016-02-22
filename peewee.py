@@ -2600,7 +2600,7 @@ class RawQuery(Query):
 class SelectQuery(Query):
     _node_type = 'select_query'
 
-    def __init__(self, model_class, *selection):
+    def __init__(self, model_class, *selection):#两个参数，model，返回的字段
         super(SelectQuery, self).__init__(model_class)
         self.require_commit = self.database.commit_select
         self.__select(*selection)
@@ -2674,7 +2674,7 @@ class SelectQuery(Query):
 
     def __select(self, *selection):
         self._explicit_selection = len(selection) > 0
-        selection = selection or self.model_class._meta.get_fields()
+        selection = selection or self.model_class._meta.get_fields()#没有的话就是所有哦
         self._select = self._model_shorthand(selection)
     select = returns_clone(__select)
 
