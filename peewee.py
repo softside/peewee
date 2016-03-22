@@ -4319,7 +4319,7 @@ class Model(with_metaclass(BaseModel)):
                     return sq.get(), False
                 except cls.DoesNotExist:
                     raise exc
-
+    ##好有喜感的两个方法
     @classmethod
     def create_or_get(cls, **kwargs):
         try:
